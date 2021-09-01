@@ -1,0 +1,118 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Variable
+from torch.nn import Parameter as P
+import numpy as np
+from network.PixelUnShuffle import PixelUnShuffle
+import torch
+from torch import nn
+import imageio
+import time
+
+
+def square_distance(src, dst):
+    '''
+    :param src: B, N, C
+    :param dst: B, M, c
+    :return: B, N, M
+    a^2 + b^2 - 2ab
+    '''
+    B, N, _ = src.shape
+    _, M, _ = dst.shape
+
+    dist = -2 * torch.matmul(src, dst.permute(0, 2, 1))
+
+    dist += torch.sum(src ** 2, -1).view(B, N, 1)
+    dist += torch.sum(dst ** 2, -1).view(B, 1, M)
+
+    return dist
+
+def find_k_neighbor(src, dst, K=5):
+    '''
+    :param src: B, N, C
+    :param dst: B, M, C
+    :param K: K neighbors
+    :return:
+    '''
+    sqrdists = square_distance(src, dst) # B, N, M
+
+    k_ind = sqrdists.sort(dim=-1)[1][:, :, :K] # B. N, K
+
+    return k_ind
+
+def group_features(index, src, dst):
+    '''
+    :param index: tok index B. N, K
+    :param src: B, N, C
+    :param dst: B, M, C
+    :return: B, N, K, C
+    '''
+    B, N, C = src.shape
+    B, M, C = dst.shape
+
+    dst = dst.unsqueeze(1).expand(B, N, M, C).permute(0, 3, 1, 2) # B, N, M, C -> B, C, N, M
+
+    # index = index.unsqueeze(-1)
+    # torch.gather(dst, 2, index)
+    # topk = dst[:, index, :]#[:, :, 0, 0]
+
+    topk = torch.gather(dst, 3, index.unsqueeze(1).repeat(1, C, 1, 1))
+    topk = topk.permute(0, 2, 3, 1)
+    # print(topk.shape)
+    return topk
+
+def tensor2points(x):
+    # x: B, C, H, W
+    B, C, H, W = x.shape
+    out = x.view((B, C, -1)) #
+    out = out.permute(0, 2, 1) #B, C, HW -> B, HW, C
+    return out
+
+
+class KNNLSD(nn.Module):
+    def __init__(self):
+        super(KNNLSD, self).__init__()
+
+        self.criterion = nn.L1Loss()
+
+    def forward(self, x, conf, k_ind):
+        '''
+        :param x: B, C, H, W
+        :param conf: B, 1, H, W
+        :return:
+        '''
+        x_points = tensor2points(x) # B, HW, C
+        conf_points = tensor2points(conf) # B, HW, 1
+        # k_ind = find_k_neighbor(x_points, x_points, K=5)
+        ####################################################################
+        f_topK = group_features(k_ind, x_points, x_points) # B, HW, K, C
+        c_topK = group_features(k_ind, conf_points, conf_points)  # B, HW, K, 1
+        c_topK = F.softmax(c_topK, dim=2) # B, HW, K, 1
+
+        f_topK_mean = torch.sum(f_topK * c_topK, dim=2) # B, HW, C
+
+        loss = self.criterion(x_points * (1 - conf_points), f_topK_mean.detach() * (1-conf_points.detach()))
+
+        return loss
+
+
+from PIL import Image
+import cv2
+if __name__ == "__main__":
+    im_path = '//home/hm/hm/PycharmProjects/data/ITS/SOTS (Synthetic Objective Testing Set)/SOTS/indoor/hazy/1444_4.png'
+    Ix = np.array(Image.open(im_path).convert('RGB')) / 255.
+    H = Ix.shape[1]
+    W = Ix.shape[0]
+    Ix = cv2.resize(Ix, (H//4, W//4))
+
+    Ix = Ix.transpose([2, 0, 1])
+    Ix = torch.from_numpy(Ix).float()
+    Ix = Ix.unsqueeze(0)
+
+    B, C, H, W = Ix.shape
+    conf = torch.ones(B, 1, H, W)
+
+    loss = KNNLSD()(Ix, conf)
+    print(loss)
+
